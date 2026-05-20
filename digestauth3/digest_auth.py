@@ -18,7 +18,7 @@ from urllib3.response import BaseHTTPResponse
 from urllib3.util.request import set_file_position
 from urllib3.util.url import parse_url
 
-__all__ = ['DigestPoolManager']
+__all__ = ['DigestAuth', 'DigestPoolManager']
 
 _HASH_NAME_BY_ALGORITHM = {
     'MD5': 'md5',
@@ -312,25 +312,23 @@ def _hash_body(body: object | None, hash_name: str) -> str:
     return digest.hexdigest()
 
 
-class DigestPoolManager(PoolManager):
+class DigestAuth:
     """
-    A :class:`~urllib3.PoolManager` that responds to HTTP Digest challenges.
+    HTTP Digest credentials and per-protection-space authentication state.
 
-    ``DigestPoolManager`` sends the first request without credentials. If the
-    server returns a usable ``WWW-Authenticate: Digest`` challenge, it drains
-    that response and retries once with an ``Authorization`` header.
+    ``DigestAuth`` sends the first request without credentials. If the server
+    returns a usable ``WWW-Authenticate: Digest`` challenge, it drains that
+    response and retries once with an ``Authorization`` header. Successful
+    challenges are cached by origin, realm, and protection-space prefix for
+    later preemptive authentication.
     """
 
     def __init__(
         self,
         username: str,
         password: str,
-        num_pools: int = 10,
-        headers: typing.Mapping[str, str] | None = None,
         digest_cache_size: int = _DEFAULT_NONCE_CACHE_SIZE,
-        **connection_pool_kw: typing.Any,
     ) -> None:
-        super().__init__(num_pools=num_pools, headers=headers, **connection_pool_kw)
         self.username = username
         self.password = password
         self._digest_cache_size = max(0, digest_cache_size)
@@ -340,8 +338,13 @@ class DigestPoolManager(PoolManager):
         )
         self._digest_lock = threading.Lock()
 
-    def urlopen(  # type: ignore[override]
-        self, method: str, url: str, redirect: bool = True, **kw: typing.Any
+    def urlopen(
+        self,
+        pool_manager: PoolManager,
+        method: str,
+        url: str,
+        redirect: bool = True,
+        **kw: typing.Any,
     ) -> BaseHTTPResponse:
         digest_auth_tried = kw.pop(_RETRY_MARKER, False)
         request_challenge = kw.pop(_CHALLENGE_MARKER, None)
@@ -349,16 +352,22 @@ class DigestPoolManager(PoolManager):
             kw = kw.copy()
             kw['body_pos'] = set_file_position(kw['body'], None)
 
-        if not digest_auth_tried and not self._has_authorization_header(kw):
+        if not digest_auth_tried and not self._has_authorization_header(
+            kw, pool_manager.headers
+        ):
             challenge = self._challenge_for_url(url)
             if challenge is not None:
                 try:
-                    kw = self._with_authorization(kw, challenge, method, url)
+                    kw = self._with_authorization(
+                        kw, pool_manager.headers, challenge, method, url
+                    )
                     request_challenge = challenge
                 except ValueError:
                     pass
 
-        response = super().urlopen(method, url, redirect=redirect, **kw)
+        response = PoolManager.urlopen(
+            pool_manager, method, url, redirect=redirect, **kw
+        )
 
         if response.status != 401:
             self._validate_rspauth(
@@ -376,30 +385,37 @@ class DigestPoolManager(PoolManager):
             return response
 
         try:
-            kw = self._with_authorization(kw, challenge, method, url)
+            kw = self._with_authorization(
+                kw, pool_manager.headers, challenge, method, url
+            )
         except ValueError:
             return response
 
         response.drain_conn()
         kw[_RETRY_MARKER] = True
         kw[_CHALLENGE_MARKER] = challenge
-        response = self.urlopen(method, url, redirect=redirect, **kw)
+        response = self.urlopen(pool_manager, method, url, redirect=redirect, **kw)
         if response.status != 401:
             self._store_challenge(url, challenge, response)
         return response
 
-    def _has_authorization_header(self, kw: dict[str, typing.Any]) -> bool:
-        headers = kw.get('headers') or self.headers or {}
+    def _has_authorization_header(
+        self,
+        kw: dict[str, typing.Any],
+        default_headers: typing.Mapping[str, str] | None,
+    ) -> bool:
+        headers = kw.get('headers') or default_headers or {}
         return any(header.lower() == 'authorization' for header in headers)
 
     def _with_authorization(
         self,
         kw: dict[str, typing.Any],
+        default_headers: typing.Mapping[str, str] | None,
         challenge: _DigestChallenge,
         method: str,
         url: str,
     ) -> dict[str, typing.Any]:
-        headers = HTTPHeaderDict(kw.get('headers', self.headers))
+        headers = HTTPHeaderDict(kw.get('headers', default_headers))
         headers[_AUTHORIZATION_HEADER] = self._authorization_header(
             challenge, method, url, kw.get('body')
         )
@@ -611,7 +627,11 @@ class DigestPoolManager(PoolManager):
                 )
 
         expected_rspauth = _expected_rspauth(
-            authorization_params, self.username, self.password, response_body, challenge
+            authorization_params,
+            self.username,
+            self.password,
+            response_body,
+            challenge,
         )
         if expected_rspauth is not None and not hmac.compare_digest(
             rspauth, expected_rspauth
@@ -621,3 +641,40 @@ class DigestPoolManager(PoolManager):
     def _evict_lru(self, cache: OrderedDict[typing.Any, typing.Any]) -> None:
         while len(cache) > self._digest_cache_size:
             cache.popitem(last=False)
+
+
+class DigestPoolManager(PoolManager):
+    """
+    A :class:`~urllib3.PoolManager` that can use per-request HTTP Digest auth.
+
+    Pass a :class:`DigestAuth` instance as ``digest_auth=`` to use HTTP Digest
+    authentication for a request. Without ``digest_auth``, this behaves like a
+    regular :class:`~urllib3.PoolManager`.
+    """
+
+    def __init__(
+        self,
+        num_pools: int = 10,
+        headers: typing.Mapping[str, str] | None = None,
+        **connection_pool_kw: typing.Any,
+    ) -> None:
+        if isinstance(num_pools, str) and isinstance(headers, str):
+            raise TypeError(
+                'DigestPoolManager no longer accepts credentials; use '
+                'DigestAuth(username, password) and pass it as digest_auth='
+            )
+        super().__init__(
+            num_pools=num_pools,
+            headers=headers,
+            **connection_pool_kw,
+        )
+
+    def urlopen(  # type: ignore[override]
+        self, method: str, url: str, redirect: bool = True, **kw: typing.Any
+    ) -> BaseHTTPResponse:
+        digest_auth = kw.pop('digest_auth', None)
+        if digest_auth is None:
+            return super().urlopen(method, url, redirect=redirect, **kw)
+        if not isinstance(digest_auth, DigestAuth):
+            raise TypeError('digest_auth must be a DigestAuth instance')
+        return digest_auth.urlopen(self, method, url, redirect=redirect, **kw)

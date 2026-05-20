@@ -1,3 +1,3 @@
-from .digest_auth import DigestPoolManager
+from .digest_auth import DigestAuth, DigestPoolManager
 
-__all__ = ['DigestPoolManager']
+__all__ = ['DigestAuth', 'DigestPoolManager']

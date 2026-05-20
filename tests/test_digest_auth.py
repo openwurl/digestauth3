@@ -9,6 +9,7 @@ from urllib3 import HTTPResponse
 from urllib3.exceptions import ProtocolError
 
 from digestauth3.digest_auth import (
+    DigestAuth,
     DigestPoolManager,
     _build_digest_authorization,
     _choose_digest_challenge,
@@ -276,6 +277,38 @@ class TestFormatDigestAuthorization(unittest.TestCase):
 
 
 class TestDigestPoolManager(unittest.TestCase):
+    def test_without_digest_auth_behaves_like_pool_manager(self) -> None:
+        unauthorized = HTTPResponse(
+            status=401,
+            headers={
+                'WWW-Authenticate': 'Digest realm="realm", nonce="nonce", qop="auth"'
+            },
+        )
+
+        with mock.patch(
+            'digestauth3.digest_auth.PoolManager.urlopen',
+            return_value=unauthorized,
+        ) as urlopen:
+            response = DigestPoolManager().request(
+                'GET', 'http://example.com/protected'
+            )
+
+        self.assertIs(response, unauthorized)
+        self.assertEqual(urlopen.call_count, 1)
+        self.assertNotIn('digest_auth', urlopen.call_args.kwargs)
+
+    def test_rejects_non_digest_auth_object(self) -> None:
+        with self.assertRaises(TypeError):
+            DigestPoolManager().urlopen(
+                'GET',
+                'http://example.com/protected',
+                digest_auth=object(),
+            )
+
+    def test_rejects_old_credential_constructor(self) -> None:
+        with self.assertRaises(TypeError):
+            DigestPoolManager('user', 'password')
+
     def test_retries_once_without_mutating_headers(self) -> None:
         unauthorized = HTTPResponse(
             status=401,
@@ -290,8 +323,11 @@ class TestDigestPoolManager(unittest.TestCase):
             'digestauth3.digest_auth.PoolManager.urlopen',
             side_effect=[unauthorized, authorized],
         ) as urlopen:
-            response = DigestPoolManager('user', 'password').request(
-                'GET', 'http://example.com/protected', headers=headers
+            response = DigestPoolManager().request(
+                'GET',
+                'http://example.com/protected',
+                headers=headers,
+                digest_auth=DigestAuth('user', 'password'),
             )
 
         self.assertIs(response, authorized)
@@ -315,8 +351,11 @@ class TestDigestPoolManager(unittest.TestCase):
             'digestauth3.digest_auth.PoolManager.urlopen',
             side_effect=[unauthorized, authorized],
         ):
-            response = DigestPoolManager('user', 'password').urlopen(
-                'GET', 'http://example.com/protected', headers=None
+            response = DigestPoolManager().urlopen(
+                'GET',
+                'http://example.com/protected',
+                headers=None,
+                digest_auth=DigestAuth('user', 'password'),
             )
 
         self.assertIs(response, authorized)
@@ -333,8 +372,10 @@ class TestDigestPoolManager(unittest.TestCase):
             'digestauth3.digest_auth.PoolManager.urlopen',
             side_effect=[unauthorized, unauthorized],
         ) as urlopen:
-            response = DigestPoolManager('user', 'password').request(
-                'GET', 'http://example.com/protected'
+            response = DigestPoolManager().request(
+                'GET',
+                'http://example.com/protected',
+                digest_auth=DigestAuth('user', 'password'),
             )
 
         self.assertIs(response, unauthorized)
@@ -379,12 +420,23 @@ class TestDigestPoolManager(unittest.TestCase):
                 side_effect=[unauthorized, authorized, preemptive],
             ) as urlopen,
         ):
-            http = DigestPoolManager('user', 'password')
+            http = DigestPoolManager()
+            digest_auth = DigestAuth('user', 'password')
             self.assertIs(
-                http.request('GET', 'http://example.com/protected'), authorized
+                http.request(
+                    'GET',
+                    'http://example.com/protected',
+                    digest_auth=digest_auth,
+                ),
+                authorized,
             )
             self.assertIs(
-                http.request('GET', 'http://example.com/protected'), preemptive
+                http.request(
+                    'GET',
+                    'http://example.com/protected',
+                    digest_auth=digest_auth,
+                ),
+                preemptive,
             )
 
         self.assertEqual(urlopen.call_count, 3)
@@ -392,6 +444,65 @@ class TestDigestPoolManager(unittest.TestCase):
         params = _parse_digest_challenges([headers['Authorization']])[0]
         self.assertEqual(params['nonce'], 'next-nonce')
         self.assertEqual(params['nc'], '00000001')
+
+    def test_auth_state_is_scoped_to_digest_auth_object(self) -> None:
+        unauthorized = HTTPResponse(
+            status=401,
+            headers={
+                'WWW-Authenticate': 'Digest realm="realm", nonce="nonce", qop="auth"'
+            },
+        )
+        alice_authorized = HTTPResponse(status=200)
+        bob_authorized = HTTPResponse(status=200)
+        alice_preemptive = HTTPResponse(status=200)
+        bob_preemptive = HTTPResponse(status=200)
+
+        with mock.patch(
+            'digestauth3.digest_auth.PoolManager.urlopen',
+            side_effect=[
+                unauthorized,
+                alice_authorized,
+                unauthorized,
+                bob_authorized,
+                alice_preemptive,
+                bob_preemptive,
+            ],
+        ) as urlopen:
+            http = DigestPoolManager()
+            alice_auth = DigestAuth('alice', 'alice-password')
+            bob_auth = DigestAuth('bob', 'bob-password')
+            url = 'http://example.com/protected'
+
+            self.assertIs(
+                http.request('GET', url, digest_auth=alice_auth),
+                alice_authorized,
+            )
+            self.assertIs(
+                http.request('GET', url, digest_auth=bob_auth),
+                bob_authorized,
+            )
+            self.assertIs(
+                http.request('GET', url, digest_auth=alice_auth),
+                alice_preemptive,
+            )
+            self.assertIs(
+                http.request('GET', url, digest_auth=bob_auth),
+                bob_preemptive,
+            )
+
+        self.assertNotIn('Authorization', urlopen.call_args_list[0].kwargs['headers'])
+        self.assertNotIn('Authorization', urlopen.call_args_list[2].kwargs['headers'])
+
+        alice_params = _parse_digest_challenges(
+            [urlopen.call_args_list[4].kwargs['headers']['Authorization']]
+        )[0]
+        bob_params = _parse_digest_challenges(
+            [urlopen.call_args_list[5].kwargs['headers']['Authorization']]
+        )[0]
+        self.assertEqual(alice_params['username'], 'alice')
+        self.assertEqual(bob_params['username'], 'bob')
+        self.assertEqual(alice_params['nc'], '00000002')
+        self.assertEqual(bob_params['nc'], '00000002')
 
     def test_accepts_nextnonce_without_rspauth_for_legacy_qop(self) -> None:
         unauthorized = HTTPResponse(
@@ -406,8 +517,10 @@ class TestDigestPoolManager(unittest.TestCase):
             'digestauth3.digest_auth.PoolManager.urlopen',
             side_effect=[unauthorized, authorized],
         ):
-            response = DigestPoolManager('user', 'password').request(
-                'GET', 'http://example.com/protected'
+            response = DigestPoolManager().request(
+                'GET',
+                'http://example.com/protected',
+                digest_auth=DigestAuth('user', 'password'),
             )
 
         self.assertIs(response, authorized)
@@ -433,8 +546,10 @@ class TestDigestPoolManager(unittest.TestCase):
             ),
         ):
             with self.assertRaises(ProtocolError):
-                DigestPoolManager('user', 'password').request(
-                    'GET', 'http://example.com/protected'
+                DigestPoolManager().request(
+                    'GET',
+                    'http://example.com/protected',
+                    digest_auth=DigestAuth('user', 'password'),
                 )
 
     def test_updates_nextnonce_for_all_domain_prefixes(self) -> None:
@@ -443,9 +558,9 @@ class TestDigestPoolManager(unittest.TestCase):
         )
         self.assertIsNotNone(challenge)
 
-        http = DigestPoolManager('user', 'password')
-        http._store_challenge('http://example.com/api/resource', challenge)
-        http._update_challenge_from_authentication_info(
+        digest_auth = DigestAuth('user', 'password')
+        digest_auth._store_challenge('http://example.com/api/resource', challenge)
+        digest_auth._update_challenge_from_authentication_info(
             'http://example.com/api/resource',
             HTTPResponse(
                 status=200, headers={'Authentication-Info': 'nextnonce="new"'}
@@ -453,7 +568,8 @@ class TestDigestPoolManager(unittest.TestCase):
         )
 
         self.assertEqual(
-            {state.params['nonce'] for state in http._challenges.values()}, {'new'}
+            {state.params['nonce'] for state in digest_auth._challenges.values()},
+            {'new'},
         )
 
     def test_caches_by_protection_space(self) -> None:
@@ -488,10 +604,23 @@ class TestDigestPoolManager(unittest.TestCase):
                 api_preemptive,
             ],
         ) as urlopen:
-            http = DigestPoolManager('user', 'password')
-            http.request('GET', 'http://example.com/api/resource')
-            http.request('GET', 'http://example.com/admin/resource')
-            http.request('GET', 'http://example.com/api/other')
+            http = DigestPoolManager()
+            digest_auth = DigestAuth('user', 'password')
+            http.request(
+                'GET',
+                'http://example.com/api/resource',
+                digest_auth=digest_auth,
+            )
+            http.request(
+                'GET',
+                'http://example.com/admin/resource',
+                digest_auth=digest_auth,
+            )
+            http.request(
+                'GET',
+                'http://example.com/api/other',
+                digest_auth=digest_auth,
+            )
 
         self.assertEqual(urlopen.call_count, 5)
         self.assertNotIn('Authorization', urlopen.call_args_list[2].kwargs['headers'])
@@ -513,9 +642,18 @@ class TestDigestPoolManager(unittest.TestCase):
             'digestauth3.digest_auth.PoolManager.urlopen',
             side_effect=[unauthorized, authorized, preemptive],
         ) as urlopen:
-            http = DigestPoolManager('user', 'password')
-            http.request('GET', 'http://example.com/api/v1/users')
-            http.request('GET', 'http://example.com/api/v2/data')
+            http = DigestPoolManager()
+            digest_auth = DigestAuth('user', 'password')
+            http.request(
+                'GET',
+                'http://example.com/api/v1/users',
+                digest_auth=digest_auth,
+            )
+            http.request(
+                'GET',
+                'http://example.com/api/v2/data',
+                digest_auth=digest_auth,
+            )
 
         self.assertEqual(urlopen.call_count, 3)
         headers = urlopen.call_args_list[2].kwargs['headers']
@@ -556,8 +694,10 @@ class TestDigestPoolManager(unittest.TestCase):
                 side_effect=[unauthorized, authorized],
             ),
         ):
-            response = DigestPoolManager('user', 'password').request(
-                'GET', 'http://example.com/protected'
+            response = DigestPoolManager().request(
+                'GET',
+                'http://example.com/protected',
+                digest_auth=DigestAuth('user', 'password'),
             )
 
         self.assertIs(response, authorized)
@@ -599,8 +739,10 @@ class TestDigestPoolManager(unittest.TestCase):
                 side_effect=[unauthorized, authorized],
             ),
         ):
-            response = DigestPoolManager('Jäsøn', 'pässword').request(
-                'GET', 'http://example.com/protected'
+            response = DigestPoolManager().request(
+                'GET',
+                'http://example.com/protected',
+                digest_auth=DigestAuth('Jäsøn', 'pässword'),
             )
 
         self.assertIs(response, authorized)
@@ -621,8 +763,10 @@ class TestDigestPoolManager(unittest.TestCase):
             side_effect=[unauthorized, authorized],
         ):
             with self.assertRaises(ProtocolError):
-                DigestPoolManager('user', 'password').request(
-                    'GET', 'http://example.com/protected'
+                DigestPoolManager().request(
+                    'GET',
+                    'http://example.com/protected',
+                    digest_auth=DigestAuth('user', 'password'),
                 )
 
     def test_validates_auth_int_rspauth_with_response_body(self) -> None:
@@ -662,8 +806,10 @@ class TestDigestPoolManager(unittest.TestCase):
                 side_effect=[unauthorized, authorized],
             ),
         ):
-            response = DigestPoolManager('user', 'password').request(
-                'GET', 'http://example.com/protected'
+            response = DigestPoolManager().request(
+                'GET',
+                'http://example.com/protected',
+                digest_auth=DigestAuth('user', 'password'),
             )
 
         self.assertIs(response, authorized)
@@ -680,27 +826,30 @@ class TestDigestPoolManager(unittest.TestCase):
             'digestauth3.digest_auth.PoolManager.urlopen',
             return_value=unauthorized,
         ) as urlopen:
-            response = DigestPoolManager('user', 'password').request(
+            response = DigestPoolManager().request(
                 'POST',
                 'http://example.com/protected',
                 body=iter([b'body']),
+                digest_auth=DigestAuth('user', 'password'),
             )
 
         self.assertIs(response, unauthorized)
         self.assertEqual(urlopen.call_count, 1)
 
     def test_nonce_counts_are_lru_bounded(self) -> None:
-        http = DigestPoolManager('user', 'password', digest_cache_size=2)
+        digest_auth = DigestAuth('user', 'password', digest_cache_size=2)
 
         for nonce in ('one', 'two', 'three'):
             challenge = _choose_digest_challenge(
                 [f'Digest realm="realm", nonce="{nonce}", qop="auth"']
             )
             self.assertIsNotNone(challenge)
-            http._authorization_header(challenge, 'GET', 'http://example.com/protected')
+            digest_auth._authorization_header(
+                challenge, 'GET', 'http://example.com/protected'
+            )
 
         self.assertEqual(
-            list(http._nonce_counts), [('realm', 'two'), ('realm', 'three')]
+            list(digest_auth._nonce_counts), [('realm', 'two'), ('realm', 'three')]
         )
 
     def test_nonce_counts_are_thread_safe(self) -> None:
@@ -709,10 +858,10 @@ class TestDigestPoolManager(unittest.TestCase):
         )
         self.assertIsNotNone(challenge)
 
-        http = DigestPoolManager('user', 'password')
+        digest_auth = DigestAuth('user', 'password')
 
         def build_authorization(_: int) -> str:
-            authorization = http._authorization_header(
+            authorization = digest_auth._authorization_header(
                 challenge, 'GET', 'http://example.com/protected'
             )
             return _parse_digest_challenges([authorization])[0]['nc']
@@ -729,15 +878,11 @@ class TestChooseDigestChallengeEdgeCases(unittest.TestCase):
     def test_skips_challenge_missing_realm(self) -> None:
         # A challenge that has nonce but no realm is skipped (line 111), and when
         # there are no remaining candidates the function returns None (line 136).
-        challenge = _choose_digest_challenge(
-            ['Digest nonce="n", algorithm=MD5']
-        )
+        challenge = _choose_digest_challenge(['Digest nonce="n", algorithm=MD5'])
         self.assertIsNone(challenge)
 
     def test_skips_challenge_missing_nonce(self) -> None:
-        challenge = _choose_digest_challenge(
-            ['Digest realm="realm", algorithm=MD5']
-        )
+        challenge = _choose_digest_challenge(['Digest realm="realm", algorithm=MD5'])
         self.assertIsNone(challenge)
 
     def test_skips_challenge_with_unrecognised_qop(self) -> None:
@@ -775,7 +920,13 @@ class TestExpectedRspauth(unittest.TestCase):
 
     def test_returns_none_for_qop_without_cnonce(self) -> None:
         # qop present but cnonce missing → None (line 237).
-        params = {'realm': 'r', 'nonce': 'n', 'uri': '/', 'qop': 'auth', 'nc': '00000001'}
+        params = {
+            'realm': 'r',
+            'nonce': 'n',
+            'uri': '/',
+            'qop': 'auth',
+            'nc': '00000001',
+        }
         result = _expected_rspauth(params, 'user', 'pass')
         self.assertIsNone(result)
 
@@ -802,7 +953,12 @@ class TestExpectedRspauth(unittest.TestCase):
 
     def test_sess_algorithm_without_cnonce_returns_none(self) -> None:
         # -SESS with no qop means cnonce is absent; line 265-266 returns None.
-        params = {'realm': 'realm', 'nonce': 'nonce', 'uri': '/', 'algorithm': 'MD5-SESS'}
+        params = {
+            'realm': 'realm',
+            'nonce': 'nonce',
+            'uri': '/',
+            'algorithm': 'MD5-SESS',
+        }
         result = _expected_rspauth(params, 'user', 'password')
         self.assertIsNone(result)
 
@@ -842,8 +998,10 @@ class TestDigestPoolManagerEdgeCases(unittest.TestCase):
             'digestauth3.digest_auth.PoolManager.urlopen',
             return_value=unauthorized,
         ) as urlopen:
-            response = DigestPoolManager('user', 'password').request(
-                'GET', 'http://example.com/protected'
+            response = DigestPoolManager().request(
+                'GET',
+                'http://example.com/protected',
+                digest_auth=DigestAuth('user', 'password'),
             )
 
         self.assertIs(response, unauthorized)
@@ -859,17 +1017,18 @@ class TestDigestPoolManagerEdgeCases(unittest.TestCase):
         self.assertIsNotNone(challenge)
 
         ok = HTTPResponse(status=200)
-        http = DigestPoolManager('user', 'password')
-        http._store_challenge('http://example.com/protected', challenge)
+        digest_auth = DigestAuth('user', 'password')
+        digest_auth._store_challenge('http://example.com/protected', challenge)
 
         with mock.patch(
             'digestauth3.digest_auth.PoolManager.urlopen',
             return_value=ok,
         ) as urlopen:
-            response = http.request(
+            response = DigestPoolManager().request(
                 'POST',
                 'http://example.com/protected',
                 body=iter([b'chunk']),
+                digest_auth=digest_auth,
             )
 
         self.assertIs(response, ok)
@@ -884,11 +1043,11 @@ class TestDigestPoolManagerEdgeCases(unittest.TestCase):
         )
         self.assertIsNotNone(challenge)
 
-        http = DigestPoolManager('user', 'password')
-        http._store_challenge('http://example.com/api', challenge)
-        http._store_challenge('http://example.com/api', challenge)
+        digest_auth = DigestAuth('user', 'password')
+        digest_auth._store_challenge('http://example.com/api', challenge)
+        digest_auth._store_challenge('http://example.com/api', challenge)
 
-        self.assertEqual(len(http._challenges), 1)
+        self.assertEqual(len(digest_auth._challenges), 1)
 
     def test_protection_space_ignores_different_origin_absolute_url(self) -> None:
         # An absolute URI in `domain` whose host differs from the request origin
@@ -901,8 +1060,8 @@ class TestDigestPoolManagerEdgeCases(unittest.TestCase):
         )
         self.assertIsNotNone(challenge)
 
-        http = DigestPoolManager('user', 'password')
-        prefixes = http._protection_space_prefixes(
+        digest_auth = DigestAuth('user', 'password')
+        prefixes = digest_auth._protection_space_prefixes(
             'http://example.com/resource', challenge
         )
         self.assertEqual(prefixes, ['/local'])
@@ -914,9 +1073,9 @@ class TestDigestPoolManagerEdgeCases(unittest.TestCase):
             status=200,
             headers={'Authentication-Info': 'rspauth="abc"'},
         )
-        http = DigestPoolManager('user', 'password')
+        digest_auth = DigestAuth('user', 'password')
         # Empty headers dict → no Authorization key → should not raise.
-        http._validate_rspauth(response, {}, None, None)
+        digest_auth._validate_rspauth(response, {}, None, None)
 
     def test_validate_rspauth_skips_non_digest_authorization(self) -> None:
         # Authorization header with a non-Digest scheme produces an empty
@@ -925,8 +1084,8 @@ class TestDigestPoolManagerEdgeCases(unittest.TestCase):
             status=200,
             headers={'Authentication-Info': 'rspauth="abc"'},
         )
-        http = DigestPoolManager('user', 'password')
-        http._validate_rspauth(
+        digest_auth = DigestAuth('user', 'password')
+        digest_auth._validate_rspauth(
             response,
             {'Authorization': 'Basic dXNlcjpwYXNz'},
             None,
@@ -941,16 +1100,22 @@ class TestDigestPoolManagerEdgeCases(unittest.TestCase):
         )
         self.assertIsNotNone(challenge)
         authorization = _build_digest_authorization(
-            challenge, 'GET', '/protected', 'user', 'password', 1, 'client',
+            challenge,
+            'GET',
+            '/protected',
+            'user',
+            'password',
+            1,
+            'client',
         )
         response = HTTPResponse(
             status=200,
             headers={'Authentication-Info': 'rspauth="something"'},
         )
         # HTTPResponse built without body data has _body = None.
-        http = DigestPoolManager('user', 'password')
+        digest_auth = DigestAuth('user', 'password')
         with self.assertRaises(ProtocolError):
-            http._validate_rspauth(
+            digest_auth._validate_rspauth(
                 response,
                 {'Authorization': authorization},
                 None,
@@ -965,7 +1130,14 @@ class TestDigestPoolManagerEdgeCases(unittest.TestCase):
         )
         self.assertIsNotNone(challenge)
         authorization = _build_digest_authorization(
-            challenge, 'POST', '/upload', 'user', 'password', 1, 'client', 'text body',
+            challenge,
+            'POST',
+            '/upload',
+            'user',
+            'password',
+            1,
+            'client',
+            'text body',
         )
         params = _parse_digest_challenges([authorization])[0]
         self.assertEqual(params['qop'], 'auth-int')
