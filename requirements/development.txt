@@ -1,0 +1,7 @@
+# What we want
+coverage==7.13.5
+ruff==0.15.12
+
+# What we get
+
+--requirement base.txt

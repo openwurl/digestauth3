@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools", "urllib3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "digestauth3"
+version = "0.1.0"
+authors = [
+    {name = "Wurl Engineering", email = "solutions@wurl.com"},
+]
+description = 'HTTP Digest Auth implementation for urllib3'
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+]
+dependencies = [
+    "urllib3",
+]
+
+[project.urls]
+Homepage = "https://github.com/openwurl/digestauth3"
+Documentation = "https://github.com/openwurl/digestauth3"
+Repository = "https://github.com/openwurl/digestauth3"
+
+[tool.setuptools.packages.find]
+exclude = ["tests"]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+exclude = [
+    ".git",
+    ".ruff_cache",
+]
+
+[tool.ruff.format]
+quote-style = "single"
+
+[tool.ruff.lint]
+select = ["E", "F"]
+ignore = ["E501"]
+
+[tool.coverage.run]
+include = [
+    "digestauth3/**",
+]
